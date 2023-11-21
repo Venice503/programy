@@ -1,0 +1,155 @@
+# Importujemy biblioteki
+import requests
+import hmac
+import hashlib
+import time
+import pandas as pd
+import matplotlib
+import json
+import websockets
+import sqlalchemy
+import asyncio
+
+# Podajemy nasz klucz API i sekret
+api_key = "twój klucz API"
+api_secret = "twój sekret API"
+
+# Tworzymy funkcję do generowania podpisu
+def generate_signature(api_key, api_secret, req_time, sign_params=None):
+  # Sortujemy parametry według klucza alfabetycznie
+  if sign_params:
+    sign_params = sorted(sign_params.items(), key=lambda x: x[0])
+    # Kodujemy parametry w formacie URL
+    sign_params = requests.utils.urlencode(sign_params)
+    # Łączymy parametry z kluczem API i czasem żądania
+    to_sign = f"{api_key} {req_time} {sign_params}"
+  else:
+    # Jeśli nie ma parametrów, łączymy tylko klucz API i czas żądania
+    to_sign = f"{api_key} {req_time}"
+  # Używamy funkcji HMAC z algorytmem SHA256 i sekretem API jako kluczem
+  sign = hmac.new(api_secret.encode("utf-8"), to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+  # Zwracamy podpis
+  return sign
+
+# Tworzymy funkcję do wysyłania żądania GET do API
+def get_market_info(api_key, api_secret, symbol):
+  # Ustawiamy adres URL końcowego punktu API
+  url = "https://contract.mexc.com/api/v1/public/market/ticker"
+  # Ustawiamy nagłówki żądania
+  headers = {
+    "Content-Type": "application/x-www-form-urlencoded",
+    "User-Agent": "Mozilla/5.0",
+    "Accept-Language": "en-US,en;q=0.5"
+  }
+  # Ustawiamy czas żądania w formacie YYYY-MM-DD HH:MM:SS
+  req_time = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+  # Ustawiamy parametry żądania
+  params = {
+    "symbol": symbol
+  }
+  # Generujemy podpis
+  signature = generate_signature(api_key, api_secret, req_time, params)
+  # Dodajemy parametry do adresu URL
+  params["access_key"] = api_key
+  params["t"] = req_time
+  params["sign"] = signature
+  # Wysyłamy żądanie GET i zwracamy odpowiedź
+  response = requests.get(url, headers=headers, params=params)
+  return response
+
+# Tworzymy funkcję do nawiązywania połączenia WEBSOCKET z API
+def connect_websocket(api_key, api_secret, symbol):
+  # Ustawiamy adres URL WEBSOCKET
+  url = "wss://contract.mexc.com/ws/v1/private"
+  # Ustawiamy czas żądania w formacie YYYY-MM-DD HH:MM:SS
+  req_time = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+  # Generujemy podpis
+  signature = generate_signature(api_key, api_secret, req_time)
+  # Tworzymy wiadomość do autoryzacji
+  auth_msg = {
+    "method": "auth",
+    "params": {
+      "access_key": api_key,
+      "t": req_time,
+      "sign": signature
+    }
+  }
+  # Tworzymy wiadomość do subskrypcji
+  sub_msg = {
+    "method": "sub",
+    "params": {
+      "topic": f"market.{symbol}.miniTicker"
+    }
+  }
+  # Nawiązujemy połączenie WEBSOCKET i zwracamy obiekt
+  ws = websockets.connect(url)
+  return ws, auth_msg, sub_msg
+
+# Tworzymy funkcję do tworzenia ramki danych z wiadomości WEBSOCKET
+def createframe(msg):
+  df = pd.DataFrame([msg])
+  df = df.loc[:,['symbol','time','close']]
+  df.columns = ['symbol','Time','Price']
+  df.Price = df.Price.astype(float)
+  df.Time = pd.to_datetime(df.Time, unit='ms')
+  return df
+
+# Tworzymy funkcję do wyświetlania wykresu ceny
+def plot_price(df):
+  plt.figure(figsize=(10,6))
+  plt.plot(df.Time, df.Price, color='blue', label='Price')
+  plt.xlabel('Time')
+  plt.ylabel('Price')
+  plt.title('BTCUSDT Price')
+  plt.legend()
+  plt.show()
+
+# Tworzymy funkcję główną do uruchomienia programu
+async def main():
+  # Ustawiamy symbol
+  symbol = "BTCUSDT"
+  # Wysyłamy żądanie GET do API, aby uzyskać informacje o rynku
+  result = get_market_info(api_key, api_secret, symbol).json()
+  print(result)
+  # Nawiązujemy połączenie WEBSOCKET z API
+  ws, auth_msg, sub_msg = connect_websocket(api_key, api_secret, symbol)
+  async with ws as receiver:
+    # Wysyłamy wiadomość do autoryzacji
+    await receiver.send(json.dumps(auth_msg))
+    # Odbieramy odpowiedź
+    auth_res = await receiver.recv()
+    print(auth_res)
+    # Wysyłamy wiadomość do subskrypcji
+    await receiver.send(json.dumps(sub_msg))
+    # Odbieramy odpowiedź
+    sub_res = await receiver.recv()
+    print(sub_res)
+    # Tworzymy pustą ramkę danych
+    df = pd.DataFrame()
+    # Wchodzimy w pętlę, aby odbierać dane w czasie rzeczywistym
+    while True:
+      try:
+        # Odbieramy wiadomość z danymi
+        data = await receiver.recv()
+      except websockets.exceptions.ConnectionClosed as error:
+        print("Połączenie zostało zamknięte: " + str(error))
+      # Parsujemy dane JSON
+      data = json.loads(data)['data']
+      # Tworzymy ramkę danych z danymi
+      frame = createframe(data)
+      # Dodajemy ramkę danych do bazy danych
+      frame.to_sql('BTCUSDT', engine, if_exists='append', index=False)
+      # Odczytujemy dane z bazy danych
+      df = pd.read_sql('BTCUSDT', engine)
+      # Wyświetlamy ramkę danych
+      print(frame)
+      # Wyświetlamy wykres ceny
+      plot_price(df)
+
+# Tworzymy obiekt silnika bazy danych
+engine = sqlalchemy.create_engine('sqlite:///BTCUSDTstream.db')
+
+# Uruchamiamy funkcję główną
+if __name__=="__main__":
+  loop = asyncio.get_event_loop()
+  loop.run_until_complete(main())
